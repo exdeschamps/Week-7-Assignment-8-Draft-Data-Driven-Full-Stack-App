@@ -1,5 +1,7 @@
+// import helper that generates fake restaurants and reviews
 import { generateFakeRestaurantsAndReviews } from "@/src/lib/fakeRestaurants.js";
 
+// import Firestore functions used in this module
 import {
   collection,
   onSnapshot,
@@ -16,13 +18,16 @@ import {
   getFirestore,
 } from "firebase/firestore";
 
+// import the initialized client-side Firestore instance
 import { db } from "@/src/lib/firebase/clientApp";
 
 export async function updateRestaurantImageReference(
   restaurantId,
   publicImageUrl
 ) {
+  // create a document reference for the restaurant
   const restaurantRef = doc(collection(db, "restaurants"), restaurantId);
+  // if the reference exists, update the photo field
   if (restaurantRef) {
     await updateDoc(restaurantRef, { photo: publicImageUrl });
   }
@@ -41,39 +46,32 @@ export async function updateRestaurantImageReference(
  * @param {?object} review - The full review object being written (optional, unused)
  * @returns {Promise<void>}
  */
+// helper to update restaurant aggregates in a transaction
 const updateWithRating = async (
   transaction,
   docRef,
   newRatingDocument,
   review
 ) => {
-  // Read the current restaurant document inside the transaction
-  const restaurantSnap = await transaction.get(docRef);
-  if (!restaurantSnap.exists()) {
-    // If restaurant doesn't exist, nothing to update.
-    return;
-  }
+  // fetch the restaurant document inside the transaction
+  const restaurant = await transaction.get(docRef);
+  // compute new aggregate values
+  const data = restaurant.data();
+  // increment number of ratings and compute new average
+  const newNumRatings = data?.numRatings ? data.numRatings + 1 : 1;
+  // compute new sum and average ratings
+  const newSumRating = (data?.sumRating || 0) + Number(review.rating);
+  const newAverage = newSumRating / newNumRatings;
 
-  const restaurantData = restaurantSnap.data();
-
-  // Defensive defaults
-  const currentNumRatings = Number(restaurantData.numRatings || 0);
-  const currentAvg = Number(restaurantData.avgRating || 0);
-
-  // New rating value
-  const newRating = Number(newRatingDocument.rating || 0);
-
-  // Compute new aggregates
-  const newNumRatings = currentNumRatings + 1;
-  const newAvg =
-    newNumRatings === 0
-      ? 0
-      : (currentAvg * currentNumRatings + newRating) / newNumRatings;
-
-  // Update the restaurant document within the same transaction
   transaction.update(docRef, {
     numRatings: newNumRatings,
-    avgRating: newAvg,
+    sumRating: newSumRating,
+    avgRating: newAverage,
+  });
+
+  transaction.set(newRatingDocument, {
+    ...review,
+    timestamp: Timestamp.fromDate(new Date()),
   });
 };
 
@@ -89,60 +87,70 @@ const updateWithRating = async (
  * @param {{rating: number, text?: string, user?: object}} review - Review data; must include `rating`
  * @returns {Promise<void>} Resolves when write completes
  */
-export async function addReviewToRestaurant(firestoreDb = db, restaurantId, review) {
-  if (!restaurantId) {
-    throw new Error("Invalid restaurantId");
-  }
-  if (!review || typeof review.rating !== "number") {
-    throw new Error("Review must include a numeric rating field");
-  }
+// add a review to a restaurant and update aggregates atomically
+export async function addReviewToRestaurant(db, restaurantId, review) {
+        if (!restaurantId) {
+                throw new Error("No restaurant ID has been provided.");
+        }
+// validate review object
+        if (!review) {
+                throw new Error("A valid review has not been provided.");
+        }
+// validate rating value
+        try {
+                const docRef = doc(collection(db, "restaurants"), restaurantId);
+                const newRatingDocument = doc(
+                        collection(db, `restaurants/${restaurantId}/ratings`)
+                );
 
-  const ratingsColRef = collection(firestoreDb, "restaurants", restaurantId, "ratings");
-  const restaurantDocRef = doc(collection(firestoreDb, "restaurants"), restaurantId);
-
-  // Use a transaction so that adding the rating and updating aggregates is atomic
-  await runTransaction(firestoreDb, async (transaction) => {
-    // Create the new rating document via addDoc outside the transaction is common,
-    // but to ensure atomicity we set a new doc with generated id inside transaction.
-    const newRatingRef = doc(ratingsColRef);
-
-    const ratingToWrite = {
-      ...review,
-      rating: Number(review.rating),
-      timestamp: Timestamp.now(),
-    };
-
-    transaction.set(newRatingRef, ratingToWrite);
-
-    // Update parent restaurant aggregates
-    await updateWithRating(transaction, restaurantDocRef, ratingToWrite, review);
-  });
+                // corrected line
+                await runTransaction(db, transaction =>
+                        updateWithRating(transaction, docRef, newRatingDocument, review)
+                );
+        } catch (error) {
+                console.error(
+                        "There was an error adding the rating to the restaurant",
+                        error
+                );
+                throw error;
+        }
 }
 
+// apply optional filters to a query for restaurants
 function applyQueryFilters(q, { category, city, price, sort }) {
+  // filter by category when provided
   if (category) {
     q = query(q, where("category", "==", category));
   }
+  // filter by city when provided
   if (city) {
     q = query(q, where("city", "==", city));
   }
+  // filter by price level when provided
   if (price) {
     // price is expected to be a number/enum representing price level
     q = query(q, where("price", "==", price));
   }
+  // apply sort ordering (default to average rating desc)
   if (sort === "Rating" || !sort) {
     q = query(q, orderBy("avgRating", "desc"));
   } else if (sort === "Review") {
     q = query(q, orderBy("numRatings", "desc"));
   }
+  // return the modified query
   return q;
 }
 
+// fetch restaurants (server-side usage) with optional filters
 export async function getRestaurants(db = db, filters = {}) {
+  // start a base query for restaurants
   let q = query(collection(db, "restaurants"));
 
+  // apply provided query filters
   q = applyQueryFilters(q, filters);
+  // execute the query
   const results = await getDocs(q);
+  // map documents to plain objects with date conversion
   return results.docs.map((doc) => {
     return {
       id: doc.id,
@@ -155,15 +163,18 @@ export async function getRestaurants(db = db, filters = {}) {
 
 
 // function provides a callback mechanism so that the callback is invoked every time a change is made to the restaurant's collection
+// subscribe to realtime updates for restaurants collection
 export function getRestaurantsSnapshot(cb, filters = {}) {
+  // validate callback
   if (typeof cb !== "function") {
     console.log("Error: The callback parameter is not a function");
     return;
   }
 
+  // create base query and apply filters
   let q = query(collection(db, "restaurants"));
   q = applyQueryFilters(q, filters);
-//
+  // return the onSnapshot unsubscribe function
   return onSnapshot(q, (querySnapshot) => {
     const results = querySnapshot.docs.map((doc) => {
       return {
@@ -174,18 +185,23 @@ export function getRestaurantsSnapshot(cb, filters = {}) {
       };
     });
 
+    // invoke the caller's callback with the results
     cb(results);
   });
 }
 // Fetch a single restaurant by ID
+// fetch a single restaurant by ID
 export async function getRestaurantById(db, restaurantId) {
+  // validate id
   if (!restaurantId) {
     console.log("Error: Invalid ID received: ", restaurantId);
     return;
   }
-  // Create a reference to the restaurant document
+  // create a reference to the restaurant document
   const docRef = doc(db, "restaurants", restaurantId);
+  // fetch the document snapshot
   const docSnap = await getDoc(docRef);
+  // return plain object with converted timestamp
   return {
     ...docSnap.data(),
     timestamp: docSnap.data().timestamp.toDate(),
@@ -199,13 +215,17 @@ export async function getRestaurantById(db, restaurantId) {
  * @param {(data: object|null) => void} cb - Callback invoked with the restaurant data
  * @returns {function()} unsubscribe function returned by onSnapshot
  */
+// subscribe to realtime updates for a single restaurant
 export function getRestaurantSnapshotById(restaurantId, cb) {
+  // validate input
   if (!restaurantId) {
     console.log("Error: Invalid restaurantId received: ", restaurantId);
     return;
   }
 
+  // reference to the restaurant document
   const restaurantRef = doc(db, "restaurants", restaurantId);
+  // subscribe and invoke cb with plain data on updates
   return onSnapshot(restaurantRef, (docSnap) => {
     if (!docSnap.exists()) {
       cb(null);
@@ -220,17 +240,21 @@ export function getRestaurantSnapshotById(restaurantId, cb) {
   });
 }
 
+// fetch reviews for a restaurant ordered by timestamp desc
 export async function getReviewsByRestaurantId(db, restaurantId) {
+  // validate id
   if (!restaurantId) {
     console.log("Error: Invalid restaurantId received: ", restaurantId);
     return;
   }
 
+  // build query against the ratings subcollection
   const q = query(
     collection(db, "restaurants", restaurantId, "ratings"),
     orderBy("timestamp", "desc")
   );
 
+  // execute and map results
   const results = await getDocs(q);
   return results.docs.map((doc) => {
     return {
@@ -242,16 +266,20 @@ export async function getReviewsByRestaurantId(db, restaurantId) {
   });
 }
 
+// subscribe to realtime updates for reviews of a restaurant
 export function getReviewsSnapshotByRestaurantId(restaurantId, cb) {
+  // validate input
   if (!restaurantId) {
     console.log("Error: Invalid restaurantId received: ", restaurantId);
     return;
   }
 
+  // query the ratings subcollection ordered by timestamp
   const q = query(
     collection(db, "restaurants", restaurantId, "ratings"),
     orderBy("timestamp", "desc")
   );
+  // subscribe and map results to plain objects
   return onSnapshot(q, (querySnapshot) => {
     const results = querySnapshot.docs.map((doc) => {
       return {
@@ -265,8 +293,11 @@ export function getReviewsSnapshotByRestaurantId(restaurantId, cb) {
   });
 }
 
+// generate and add fake restaurants and reviews to Firestore (dev helper)
 export async function addFakeRestaurantsAndReviews() {
+  // generate fake data
   const data = await generateFakeRestaurantsAndReviews();
+  // iterate and write to Firestore
   for (const { restaurantData, ratingsData } of data) {
     try {
       const docRef = await addDoc(
